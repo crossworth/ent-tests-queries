@@ -7,10 +7,13 @@ import (
 	"strconv"
 	"testing"
 
+	"entgo.io/bug/ent/node"
 	"entgo.io/ent/dialect"
+	"entgo.io/ent/dialect/sql"
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/stretchr/testify/require"
 
 	"entgo.io/bug/ent"
 	"entgo.io/bug/ent/enttest"
@@ -56,9 +59,51 @@ func TestBugMaria(t *testing.T) {
 
 func test(t *testing.T, client *ent.Client) {
 	ctx := context.Background()
-	client.User.Delete().ExecX(ctx)
-	client.User.Create().SetName("Ariel").SetAge(30).ExecX(ctx)
-	if n := client.User.Query().CountX(ctx); n != 1 {
-		t.Errorf("unexpected number of users: %d", n)
+	client.Node.Delete().ExecX(ctx)
+	client.Node.Create().SetFrom("Events").SetTo("Users").SaveX(ctx)
+	client.Node.Create().SetFrom("Events").SetTo("Orders").SaveX(ctx)
+	client.Node.Create().SetFrom("Orders").SetTo("Users").SaveX(ctx)
+
+	var nodes []struct {
+		Node     string `json:"name"`
+		InCount  int    `json:"incount"`
+		OutCount int    `json:"outcount"`
 	}
+	client.Node.Query().Modify(func(s *sql.Selector) {
+		// union both types
+		tb := sql.Table(node.Table)
+		n1 := sql.Select(sql.As(tb.C(node.FieldFrom), "name")).From(tb)
+		n2 := sql.Select(sql.As(tb.C(node.FieldTo), "name")).From(tb)
+		q := n1.Union(n2).As("q")
+
+		// create a join
+		in := sql.Table(node.Table).As("i")
+		out := sql.Table(node.Table).As("o")
+		s.From(q).LeftJoin(in).On(q.C("name"), in.C(node.FieldFrom))
+		s.LeftJoin(out).On(q.C("name"), out.C(node.FieldTo))
+
+		s.Select(
+			sql.Distinct(q.C("name")),
+			sql.As(sql.Count(in.C(node.FieldFrom)), "incount"),
+			sql.As(sql.Count(out.C(node.FieldTo)), "outcount"),
+		)
+		s.GroupBy(q.C("name"))
+	}).ScanX(ctx, &nodes)
+	for _, n := range nodes {
+		fmt.Println(n.Node, n.InCount, n.OutCount)
+	}
+
+	// Events 2 0
+	// Orders 1 1
+	// Users 0 2
+	require.Len(t, nodes, 3)
+	require.Equal(t, "Events", nodes[0].Node)
+	require.Equal(t, 2, nodes[0].InCount)
+	require.Equal(t, 0, nodes[0].OutCount)
+	require.Equal(t, "Orders", nodes[1].Node)
+	require.Equal(t, 1, nodes[1].InCount)
+	require.Equal(t, 1, nodes[1].OutCount)
+	require.Equal(t, "Users", nodes[2].Node)
+	require.Equal(t, 0, nodes[2].InCount)
+	require.Equal(t, 2, nodes[2].OutCount)
 }
